@@ -1,1 +1,3 @@
-/target
+/target/
+/rasta_stack/target/
+.idea/
