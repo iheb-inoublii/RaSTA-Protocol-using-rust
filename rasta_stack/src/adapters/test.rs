@@ -1,5 +1,6 @@
 use crate::platform::transport::{Transport, TransportError};
 
+#[derive(Clone, Copy)]
 pub struct MockTransport {
     pub last_sent: [u8; 512],
     pub last_sent_len: usize,
@@ -34,6 +35,6 @@ impl Transport for MockTransport {
 
     fn receive(&mut self, _buffer: &mut [u8]) -> Result<usize, TransportError> {
         // Mocking no data received
-        Err(TransportError::ReceiveFailed)
+        Ok(0)
     }
 }

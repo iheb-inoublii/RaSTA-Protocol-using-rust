@@ -1,9 +1,11 @@
+use crate::core::connection_state_machine::{RastaState, StateMachine};
 use crate::core::heartbeat::HeartbeatHandler;
-use crate::core::packet::{Packet, PacketError, PacketType};
-use crate::core::redundancy::RedundancyLayer;
+use crate::core::pdu::{Packet, PacketError, PacketType};
+use crate::core::redundancy_management::{RedundancyConfig, RedundancyLayer};
 use crate::core::retransmission::RetransmissionBuffer;
-use crate::core::sequence::{SequenceHandler, SequenceResult};
-use crate::core::state_machine::{RastaState, StateMachine};
+use crate::core::safety_code::SafetyCodeConfig;
+use crate::core::sequencing::{SequenceHandler, SequenceResult};
+use crate::core::time_supervision::TimeSupervisor;
 use crate::platform::clock::Clock;
 use crate::platform::timer::Timer;
 use crate::platform::transport::{Transport, TransportError};
@@ -18,15 +20,20 @@ pub enum ConnectionError {
     SafetyTimeout,
     StateTransitionInvalid,
     InvalidPayloadSize,
+    ReceiveQueueEmpty,
+    ReceiveQueueFull,
 }
 
 #[derive(Clone, Copy)]
 pub struct RastaConfig {
     pub sender_id: u32,
     pub remote_id: u32,
-    pub security_key: [u8; 16],
+    pub safety_code: SafetyCodeConfig,
+    pub redundancy: RedundancyConfig,
     pub t_max: u32,
     pub initial_seq: u32,
+    pub heartbeat_interval_ms: u32,
+    pub n_send_max: u16,
 }
 
 pub struct RastaConnection<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> {
@@ -38,11 +45,18 @@ pub struct RastaConnection<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clo
     pub retransmission: RetransmissionBuffer,
     pub sender_id: u32,
     pub remote_id: u32,
-    pub security_key: [u8; 16],
+    pub safety_code: SafetyCodeConfig,
     pub t_max: u32,
+    pub n_send_max: u16,
+    remote_n_send_max: u16,
     last_received_timestamp: u32,
     rx_buffer: [u8; 512],
     tx_buffer: [u8; 512],
+    app_rx_buffer: [[u8; 256]; 8],
+    app_rx_len: [usize; 8],
+    app_rx_head: usize,
+    app_rx_tail: usize,
+    app_rx_count: usize,
 }
 
 impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1, T2, TimerCtx, C> {
@@ -55,18 +69,25 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
     ) -> Self {
         RastaConnection {
             state_machine: StateMachine::new(),
-            redundancy: RedundancyLayer::new(transport_a, transport_b),
+            redundancy: RedundancyLayer::with_config(transport_a, transport_b, config.redundancy),
             clock,
-            heartbeat: HeartbeatHandler::new(timer, 500),
+            heartbeat: HeartbeatHandler::new(timer, config.heartbeat_interval_ms),
             sequence: SequenceHandler::with_initial_tx(config.initial_seq),
             retransmission: RetransmissionBuffer::new(),
             sender_id: config.sender_id,
             remote_id: config.remote_id,
-            security_key: config.security_key,
+            safety_code: config.safety_code,
             t_max: config.t_max,
+            n_send_max: config.n_send_max,
+            remote_n_send_max: config.n_send_max,
             last_received_timestamp: 0,
             rx_buffer: [0; 512],
             tx_buffer: [0; 512],
+            app_rx_buffer: [[0; 256]; 8],
+            app_rx_len: [0; 8],
+            app_rx_head: 0,
+            app_rx_tail: 0,
+            app_rx_count: 0,
         }
     }
 
@@ -83,7 +104,13 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
             return Err(ConnectionError::ProtocolViolation);
         }
         self.transition(RastaState::Start)?;
-        self.send_packet(PacketType::ConnectionRequest, &[])?;
+        let payload = self.connection_payload();
+        self.send_packet(
+            PacketType::ConnectionRequest,
+            payload
+                .get(..14)
+                .ok_or(ConnectionError::InvalidPayloadSize)?,
+        )?;
         Ok(())
     }
 
@@ -129,7 +156,7 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
                 .rx_buffer
                 .get(..bytes_read)
                 .ok_or(ConnectionError::BufferFull)?;
-            let parse_res = Packet::parse(rx_slice, &self.security_key);
+            let parse_res = Packet::parse(rx_slice, &self.safety_code);
             match parse_res {
                 Ok(packet) => self.handle_packet(packet)?,
                 Err(PacketError::ChecksumMismatch) => {
@@ -159,31 +186,37 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
             }
         }
 
-        let local_now = self.clock.now_ms();
-        let diff = local_now.wrapping_sub(packet.timestamp);
-        if diff < 0x80000000 {
-            // Packet is from the past or present
-            if diff > self.t_max {
-                return self.disconnect_with_error();
-            }
-        } else {
-            // Packet timestamp is in the future
-            let future_offset = packet.timestamp.wrapping_sub(local_now);
-            if future_offset > 100 {
-                return self.disconnect_with_error();
-            }
+        let time_supervisor = TimeSupervisor::new(self.t_max);
+        if time_supervisor
+            .validate(self.clock.now_ms(), packet.timestamp)
+            .is_err()
+        {
+            return self.disconnect_with_error();
         }
 
-        match self.sequence.validate_rx(packet.sequence_number) {
-            SequenceResult::Ok => {}
-            SequenceResult::Gap(expected) => {
-                self.transition(RastaState::Retransmission)?;
-                // Send expected sequence number in payload (4 bytes)
-                let payload = expected.to_be_bytes();
-                self.send_packet(PacketType::RetransmissionRequest, &payload)?;
-                return Ok(());
+        match packet.packet_type {
+            PacketType::ConnectionRequest
+            | PacketType::ConnectionResponse
+            | PacketType::RetransmissionResponse
+            | PacketType::DisconnectionRequest => {}
+            _ => {
+                if !self
+                    .sequence
+                    .validate_range(packet.sequence_number, self.remote_n_send_max)
+                {
+                    return Err(ConnectionError::ProtocolViolation);
+                }
+                match self.sequence.validate_rx(packet.sequence_number) {
+                    SequenceResult::Ok => {}
+                    SequenceResult::Gap(expected) => {
+                        self.transition(RastaState::Retransmission)?;
+                        let payload = expected.to_le_bytes();
+                        self.send_packet(PacketType::RetransmissionRequest, &payload)?;
+                        return Ok(());
+                    }
+                    SequenceResult::Duplicate => return Ok(()),
+                }
             }
-            SequenceResult::Duplicate => return Ok(()),
         }
 
         self.last_received_timestamp = packet.timestamp;
@@ -193,12 +226,22 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
         match self.state_machine.current_state {
             RastaState::Down if packet.packet_type == PacketType::ConnectionRequest => {
                 self.remote_id = packet.sender_id;
+                self.sequence.accept_initial_rx(packet.sequence_number);
+                self.apply_connection_payload(&packet)?;
                 self.transition(RastaState::Start)?;
-                self.send_packet(PacketType::ConnectionResponse, &[])?;
+                let payload = self.connection_payload();
+                self.send_packet(
+                    PacketType::ConnectionResponse,
+                    payload
+                        .get(..14)
+                        .ok_or(ConnectionError::InvalidPayloadSize)?,
+                )?;
             }
             RastaState::Start => {
                 match packet.packet_type {
                     PacketType::ConnectionResponse => {
+                        self.sequence.accept_initial_rx(packet.sequence_number);
+                        self.apply_connection_payload(&packet)?;
                         self.transition(RastaState::Up)?;
                         self.send_packet(PacketType::Heartbeat, &[])?;
                     }
@@ -223,7 +266,7 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
                             .payload
                             .get(0..4)
                             .ok_or(ConnectionError::InvalidPayloadSize)?;
-                        let requested_seq = u32::from_be_bytes([
+                        let requested_seq = u32::from_le_bytes([
                             *seq_bytes
                                 .first()
                                 .ok_or(ConnectionError::InvalidPayloadSize)?,
@@ -238,9 +281,11 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
                                 .ok_or(ConnectionError::InvalidPayloadSize)?,
                         ]);
                         self.retransmit_from(requested_seq)?;
+                        self.send_packet(PacketType::RetransmissionResponse, &[])?;
                     }
                     PacketType::RetransmissionResponse => {
                         if self.state_machine.current_state == RastaState::Retransmission {
+                            self.sequence.accept_initial_rx(packet.sequence_number);
                             self.transition(RastaState::Up)?;
                         }
                     }
@@ -248,7 +293,10 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
                         let _ = self.transition(RastaState::Closed);
                         let _ = self.transition(RastaState::Down);
                     }
-                    PacketType::Data | PacketType::RetransmissionData | PacketType::Heartbeat => {
+                    PacketType::Data | PacketType::RetransmissionData => {
+                        self.enqueue_application_data(&packet)?;
+                    }
+                    PacketType::Heartbeat => {
                         // Normal operation
                     }
                     _ => {
@@ -315,7 +363,7 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
         p_type: PacketType,
         payload: &[u8],
     ) -> Result<(), ConnectionError> {
-        if payload.len() > 256 {
+        if payload.len() > Packet::MAX_PAYLOAD_SIZE {
             return Err(ConnectionError::InvalidPayloadSize);
         }
 
@@ -340,7 +388,7 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
         }
 
         let size = packet
-            .serialize(&mut self.tx_buffer, &self.security_key)
+            .serialize(&mut self.tx_buffer, &self.safety_code)
             .map_err(ConnectionError::Packet)?;
         let tx_slice = self
             .tx_buffer
@@ -350,11 +398,89 @@ impl<T1: Transport, T2: Transport, TimerCtx: Timer, C: Clock> RastaConnection<T1
             .send(tx_slice)
             .map_err(ConnectionError::Transport)?;
 
-        if (p_type == PacketType::Data || p_type == PacketType::RetransmissionData)
-            && !self.retransmission.store(packet)
-        {
+        if p_type == PacketType::Data && !self.retransmission.store(packet) {
             return Err(ConnectionError::BufferFull);
         }
+        Ok(())
+    }
+
+    pub fn receive_data(&mut self, output: &mut [u8]) -> Result<usize, ConnectionError> {
+        if self.app_rx_count == 0 {
+            return Err(ConnectionError::ReceiveQueueEmpty);
+        }
+        let len = *self
+            .app_rx_len
+            .get(self.app_rx_head)
+            .ok_or(ConnectionError::InvalidPayloadSize)?;
+        if output.len() < len {
+            return Err(ConnectionError::BufferFull);
+        }
+        let src = self
+            .app_rx_buffer
+            .get(self.app_rx_head)
+            .and_then(|b| b.get(..len))
+            .ok_or(ConnectionError::InvalidPayloadSize)?;
+        let dst = output
+            .get_mut(..len)
+            .ok_or(ConnectionError::InvalidPayloadSize)?;
+        dst.copy_from_slice(src);
+        self.app_rx_head = (self.app_rx_head + 1) % self.app_rx_buffer.len();
+        self.app_rx_count -= 1;
+        Ok(len)
+    }
+
+    pub fn has_received_data(&self) -> bool {
+        self.app_rx_count > 0
+    }
+
+    fn enqueue_application_data(&mut self, packet: &Packet) -> Result<(), ConnectionError> {
+        if self.app_rx_count == self.app_rx_buffer.len() {
+            return Err(ConnectionError::ReceiveQueueFull);
+        }
+        let len = packet.payload_len;
+        let dst = self
+            .app_rx_buffer
+            .get_mut(self.app_rx_tail)
+            .and_then(|b| b.get_mut(..len))
+            .ok_or(ConnectionError::InvalidPayloadSize)?;
+        let src = packet
+            .payload
+            .get(..len)
+            .ok_or(ConnectionError::InvalidPayloadSize)?;
+        dst.copy_from_slice(src);
+        if let Some(slot_len) = self.app_rx_len.get_mut(self.app_rx_tail) {
+            *slot_len = len;
+        }
+        self.app_rx_tail = (self.app_rx_tail + 1) % self.app_rx_buffer.len();
+        self.app_rx_count += 1;
+        Ok(())
+    }
+
+    fn connection_payload(&self) -> [u8; 14] {
+        let mut payload = [0u8; 14];
+        payload[0] = b'0';
+        payload[1] = b'3';
+        payload[2] = b'0';
+        payload[3] = b'1';
+        payload[4..6].copy_from_slice(&self.n_send_max.to_le_bytes());
+        payload
+    }
+
+    fn apply_connection_payload(&mut self, packet: &Packet) -> Result<(), ConnectionError> {
+        if packet.payload_len < 14 {
+            return Err(ConnectionError::ProtocolViolation);
+        }
+        let nsend = u16::from_le_bytes([
+            *packet
+                .payload
+                .get(4)
+                .ok_or(ConnectionError::InvalidPayloadSize)?,
+            *packet
+                .payload
+                .get(5)
+                .ok_or(ConnectionError::InvalidPayloadSize)?,
+        ]);
+        self.remote_n_send_max = nsend;
         Ok(())
     }
 }

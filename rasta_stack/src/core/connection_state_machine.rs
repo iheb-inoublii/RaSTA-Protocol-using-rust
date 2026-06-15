@@ -1,4 +1,4 @@
-// RaSTA State Machine states (EN 50159)
+// Connection state machine for the RaSTA service.
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum RastaState {

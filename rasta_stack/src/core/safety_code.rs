@@ -1,5 +1,65 @@
-// Minimal MD4 implementation for RaSTA Safety Code (no_std)
-// Based on RFC 1320
+// Safety-code support for the Safety and Retransmission Layer.
+//
+// RaSTA allows three safety-code modes:
+// - no safety code (availability only, not safe communication),
+// - the lower 8 bytes of MD4,
+// - the full 16 bytes of MD4.
+//
+// The RaSTA network separation value is modeled as the MD4 initial value.
+// That keeps the protocol code portable and avoids tying it to a particular
+// operating system, cryptographic provider, or allocator.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SafetyCodeMode {
+    None,
+    Md4Low8,
+    Md4Full16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SafetyCodeConfig {
+    pub mode: SafetyCodeMode,
+    pub md4_initial_value: [u8; 16],
+}
+
+impl SafetyCodeConfig {
+    pub const STANDARD_MD4_INITIAL_VALUE: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ];
+
+    pub fn md4_low8(md4_initial_value: [u8; 16]) -> Self {
+        Self {
+            mode: SafetyCodeMode::Md4Low8,
+            md4_initial_value,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self.mode {
+            SafetyCodeMode::None => 0,
+            SafetyCodeMode::Md4Low8 => 8,
+            SafetyCodeMode::Md4Full16 => 16,
+        }
+    }
+
+    pub fn calculate(&self, pdu_without_safety_code: &[u8]) -> [u8; 16] {
+        match self.mode {
+            SafetyCodeMode::None => [0; 16],
+            SafetyCodeMode::Md4Low8 | SafetyCodeMode::Md4Full16 => {
+                let mut md4 = Md4::with_initial_value(self.md4_initial_value);
+                md4.update(pdu_without_safety_code);
+                md4.finalize()
+            }
+        }
+    }
+}
+
+impl Default for SafetyCodeConfig {
+    fn default() -> Self {
+        Self::md4_low8(Self::STANDARD_MD4_INITIAL_VALUE)
+    }
+}
 
 pub struct Md4 {
     state: [u32; 4],
@@ -15,8 +75,26 @@ impl Default for Md4 {
 
 impl Md4 {
     pub fn new() -> Self {
-        Md4 {
-            state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
+        Self::with_state([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476])
+    }
+
+    pub fn with_initial_value(initial_value: [u8; 16]) -> Self {
+        let mut state = [0u32; 4];
+        for i in 0..4 {
+            let offset = i * 4;
+            state[i] = u32::from_le_bytes([
+                initial_value[offset],
+                initial_value[offset + 1],
+                initial_value[offset + 2],
+                initial_value[offset + 3],
+            ]);
+        }
+        Self::with_state(state)
+    }
+
+    fn with_state(state: [u32; 4]) -> Self {
+        Self {
+            state,
             buffer: [0; 64],
             count: 0,
         }

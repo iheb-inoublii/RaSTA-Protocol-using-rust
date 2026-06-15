@@ -1,5 +1,9 @@
-// Sequence number handling for RaSTA
-// Sequence numbers must be strictly sequential. Gaps trigger retransmission.
+// Sequencing and confirmation handling for the Safety and Retransmission Layer.
+//
+// The connection-establishment and retransmission-response PDUs are allowed to
+// initialise the receive sequence number. Time-out related traffic is then
+// checked strictly: the next PDU must carry the expected receive sequence
+// number, otherwise retransmission is requested.
 
 pub struct SequenceHandler {
     current_tx: u32,
@@ -53,6 +57,15 @@ impl SequenceHandler {
         }
     }
 
+    pub fn accept_initial_rx(&mut self, received_seq: u32) {
+        self.current_rx = received_seq.wrapping_add(1);
+    }
+
+    pub fn validate_range(&self, received_seq: u32, n_send_max: u16) -> bool {
+        let max_distance = (n_send_max as u32).saturating_mul(10);
+        received_seq.wrapping_sub(self.current_rx) <= max_distance
+    }
+
     pub fn expected_rx(&self) -> u32 {
         self.current_rx
     }
@@ -71,5 +84,9 @@ impl SequenceHandler {
         } else {
             Some(self.current_rx.wrapping_sub(1))
         }
+    }
+
+    pub fn next_tx_value(&self) -> u32 {
+        self.current_tx
     }
 }

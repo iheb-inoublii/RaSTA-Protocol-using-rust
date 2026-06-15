@@ -3,4 +3,13 @@ name = "rasta_stack"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+std = []
+
+[[bin]]
+name = "rasta_node"
+path = "src/bin/rasta_node.rs"
+required-features = ["std"]
+
 [dependencies]

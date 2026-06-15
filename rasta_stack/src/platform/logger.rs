@@ -1,4 +1,5 @@
 // Simple logging trait for debugging in a no_std environment
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Info,
     Warning,
